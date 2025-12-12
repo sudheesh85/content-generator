@@ -3,6 +3,9 @@
 import { useState } from "react";
 import { Send, Paperclip, Loader2, Sparkles, Calendar, Image, Video, FileText, TrendingUp, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
+import dynamic from "next/dynamic";
+
+const ApprovalQueue = dynamic(() => import("@/components/ApprovalQueue"), { ssr: false });
 
 export default function Home() {
   const [input, setInput] = useState("");
@@ -10,6 +13,8 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(false);
   const [result, setResult] = useState<any>(null);
   const [selectedCard, setSelectedCard] = useState<string | null>(null);
+  const [campaignId, setCampaignId] = useState<string | null>(null);
+  const [showApprovalQueue, setShowApprovalQueue] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -22,11 +27,22 @@ export default function Home() {
     setResult(null);
 
     try {
-      // Create abort controller with 5 minute timeout
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 300000); // 5 minutes
+      // First check if backend is healthy
+      const healthCheck = await fetch("/api/health", {
+        method: "GET",
+        signal: AbortSignal.timeout(5000), // 5 second timeout for health check
+      });
+      
+      if (!healthCheck.ok) {
+        throw new Error("Backend is not responding. Please check if the server is running.");
+      }
 
-      const response = await fetch("/api/campaign/start", {
+      // Create abort controller with 10 minute timeout for long-running operations
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 600000); // 10 minutes
+
+      // Start campaign in background mode
+      const response = await fetch("/api/campaign/start?background=true", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -42,39 +58,225 @@ export default function Home() {
       clearTimeout(timeoutId);
 
       if (!response.ok) {
-        throw new Error("Failed to start campaign");
+        const errorData = await response.json().catch(() => ({}));
+        const error = new Error(errorData.detail?.error || "Failed to start campaign");
+        (error as any).response = response;
+        throw error;
       }
 
-      const data = await response.json();
-      console.log("Received data:", data);
+      const startData = await response.json();
+      console.log("Campaign started:", startData);
 
-      if (data.data) {
-        setResult(data.data);
+      if (startData.campaign_id) {
+        // Show progress message
         setMessages((prev) => [
           ...prev,
           {
             role: "assistant",
-            content: "✨ Campaign generated successfully! Check out the results below.",
+            content: `⏳ Campaign started (ID: ${startData.campaign_id}). Generating content... This may take 5-10 minutes.`,
           },
         ]);
+
+        // Poll for status
+        const campaignId = startData.campaign_id;
+        setCampaignId(campaignId); // Store campaign ID for approval
+        const pollInterval = 3000; // 3 seconds
+        const maxPolls = 300; // 15 minutes max
+        let pollCount = 0;
+
+        const pollStatus = async () => {
+          try {
+            const statusResponse = await fetch(`/api/campaign/${campaignId}/status`);
+            if (!statusResponse.ok) throw new Error("Failed to fetch status");
+
+            const statusData = await statusResponse.json();
+            console.log("Status:", statusData);
+
+            if (statusData.status === "completed") {
+              // Fetch full campaign data
+              const dataResponse = await fetch(`/api/campaign/${campaignId}/data`);
+              const data = await dataResponse.json();
+              console.log("Received data:", data);
+              return data;
+            } else if (statusData.status === "failed") {
+              throw new Error(statusData.error || "Campaign generation failed");
+            } else if (statusData.status === "running") {
+              // Update progress
+              setMessages((prev) => {
+                const newMessages = [...prev];
+                const lastMsg = newMessages[newMessages.length - 1];
+                if (lastMsg.role === "assistant" && lastMsg.content.startsWith("⏳")) {
+                  lastMsg.content = `⏳ ${statusData.progress || "Generating content..."}`;
+                }
+                return newMessages;
+              });
+
+              // Continue polling
+              pollCount++;
+              if (pollCount < maxPolls) {
+                await new Promise((resolve) => setTimeout(resolve, pollInterval));
+                return await pollStatus();
+              } else {
+                throw new Error("Campaign generation timed out after 15 minutes");
+              }
+            }
+          } catch (error) {
+            console.error("Polling error:", error);
+            throw error;
+          }
+        };
+
+        const data = await pollStatus();
+        console.log("Final data:", data);
+
+        if (data.data || data.strategy) {
+          const resultData = data.data || data;
+          setResult(resultData);
+          
+          // Check if awaiting approval
+          if (resultData.publish_result?.status === "awaiting_approval") {
+            setShowApprovalQueue(true);
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                content: "✨ Campaign generated! Images created successfully. Please review and approve content before publishing to Instagram & Facebook.",
+              },
+            ]);
+          } else {
+            setMessages((prev) => [
+              ...prev,
+              {
+                role: "assistant",
+                content: "✨ Campaign generated successfully! Check out the results below.",
+              },
+            ]);
+          }
+        } else {
+          console.error("No data in response:", data);
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: "⚠️ Campaign generated but no data received. Check console." },
+          ]);
+        }
       } else {
-        console.error("No data in response:", data);
         setMessages((prev) => [
           ...prev,
-          { role: "assistant", content: "⚠️ Campaign generated but no data received. Check console." },
+          { role: "assistant", content: "❌ Failed to start campaign. No campaign ID received." },
         ]);
       }
     } catch (error: any) {
       console.error("Error:", error);
-      const errorMessage = error.name === 'AbortError'
-        ? "⏱️ Request timed out. The AI agents are still working - please wait and try refreshing."
-        : "❌ Error: Failed to generate campaign. Please check backend logs.";
+      let errorMessage = "❌ Error: Failed to generate campaign. Please check backend logs.";
+      
+      if (error.name === 'AbortError') {
+        errorMessage = "⏱️ Request timed out. The AI agents are still working - please wait and try refreshing.";
+      } else if (error.message?.includes('socket hang up') || error.message?.includes('ECONNRESET')) {
+        errorMessage = "🔌 Connection lost. The backend may have crashed or timed out. Please check backend logs and try again.";
+      } else if (error.response?.status === 504) {
+        errorMessage = "⏱️ Campaign generation timed out (15 minutes). Try with a simpler request.";
+      } else if (error.response?.status === 500) {
+        errorMessage = `❌ Backend error: ${error.message || 'Check backend terminal for details.'}`;
+      }
+      
       setMessages((prev) => [
         ...prev,
         { role: "assistant", content: errorMessage },
       ]);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  // Approval handlers
+  const handleApprove = async (entryIndex: number) => {
+    if (!campaignId) return;
+    try {
+      const response = await fetch(`/api/approval/${campaignId}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entry_index: entryIndex, action: "approve" }),
+      });
+      if (!response.ok) throw new Error("Failed to approve");
+      
+      // Reload approval queue
+      const queueResponse = await fetch(`/api/approval/${campaignId}/queue`);
+      const queueData = await queueResponse.json();
+      if (result) {
+        result.calendar = { entries: queueData.queue };
+        setResult({ ...result });
+      }
+    } catch (error) {
+      console.error("Approval error:", error);
+      alert("Failed to approve entry");
+    }
+  };
+
+  const handleReject = async (entryIndex: number) => {
+    if (!campaignId) return;
+    try {
+      const response = await fetch(`/api/approval/${campaignId}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entry_index: entryIndex, action: "reject" }),
+      });
+      if (!response.ok) throw new Error("Failed to reject");
+      
+      // Reload approval queue
+      const queueResponse = await fetch(`/api/approval/${campaignId}/queue`);
+      const queueData = await queueResponse.json();
+      if (result) {
+        result.calendar = { entries: queueData.queue };
+        setResult({ ...result });
+      }
+    } catch (error) {
+      console.error("Reject error:", error);
+      alert("Failed to reject entry");
+    }
+  };
+
+  const handlePublish = async (entryIndices: number[]) => {
+    if (!campaignId) return;
+    try {
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "📤 Publishing to Instagram & Facebook..." },
+      ]);
+
+      const response = await fetch(`/api/approval/${campaignId}/publish`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+          entry_indices: entryIndices,
+          platforms: ["instagram", "facebook"]
+        }),
+      });
+      
+      if (!response.ok) throw new Error("Failed to publish");
+      
+      const publishResult = await response.json();
+      setMessages((prev) => [
+        ...prev,
+        { 
+          role: "assistant", 
+          content: `✅ Successfully published ${publishResult.published_count} posts! ${publishResult.failed_count > 0 ? `(${publishResult.failed_count} failed)` : ""}` 
+        },
+      ]);
+      
+      setShowApprovalQueue(false);
+    } catch (error) {
+      console.error("Publish error:", error);
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "❌ Failed to publish. Check console for details." },
+      ]);
+    }
+  };
+
+  const handleCaptionEdit = (entryIndex: number, newCaption: string) => {
+    if (result && result.calendar?.entries) {
+      result.calendar.entries[entryIndex].caption = newCaption;
+      setResult({ ...result });
     }
   };
 
@@ -170,7 +372,7 @@ export default function Home() {
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
                     placeholder="Describe your campaign goal..."
-                    className="flex-1 p-4 pr-14 rounded-xl border-2 border-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent bg-white shadow-sm transition-all"
+                    className="flex-1 p-4 pr-14 rounded-xl border-2 border-gray-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent bg-white shadow-sm transition-all text-gray-900 placeholder-gray-400"
                   />
                   <button
                     type="submit"
@@ -218,7 +420,21 @@ export default function Home() {
         </div>
 
         {/* Results Section */}
-        {result && (
+        {/* Approval Queue */}
+        {showApprovalQueue && result && campaignId && (
+          <div className="mt-8">
+            <ApprovalQueue
+              campaignId={campaignId}
+              queue={result.calendar?.entries || []}
+              onApprove={handleApprove}
+              onReject={handleReject}
+              onPublish={handlePublish}
+              onCaptionEdit={handleCaptionEdit}
+            />
+          </div>
+        )}
+
+        {result && !showApprovalQueue && (
           <div className="mt-8 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
             <ResultCard
               icon={<FileText className="w-6 h-6" />}

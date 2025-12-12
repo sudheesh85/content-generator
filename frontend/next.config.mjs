@@ -8,10 +8,8 @@ const nextConfig = {
             },
         ];
     },
-    // Increase timeout for long-running AI operations
-    experimental: {
-        proxyTimeout: 300000, // 5 minutes
-    },
+    // Note: Next.js rewrites don't support custom timeouts directly
+    // The timeout is handled by the fetch request in the frontend (10 minutes)
 };
 
 export default nextConfig;
