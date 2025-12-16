@@ -23,10 +23,18 @@ class ResearchAgent(BaseAgent):
         
         Gather key facts and topics.
         Return JSON with:
-        - key_facts (list)
-        - topic_list (list)
-        - faq_list (list)
-        - quotes_or_stats (list)
+        - key_facts (list of strings)
+        - topic_list (list of strings)
+        - faq_list (list - can be strings OR objects with 'question' and 'answer' keys)
+        - quotes_or_stats (list of strings)
+        
+        Example format:
+        {{
+            "key_facts": ["fact 1", "fact 2"],
+            "topic_list": ["topic 1", "topic 2"],
+            "faq_list": ["Q: question1\\nA: answer1", "Q: question2\\nA: answer2"],
+            "quotes_or_stats": ["stat 1", "stat 2"]
+        }}
         """
         
         content = await self._get_completion(prompt)
@@ -35,6 +43,13 @@ class ResearchAgent(BaseAgent):
             content = content.split("```json")[1].split("```")[0].strip()
         elif "```" in content:
             content = content.split("```")[1].split("```")[0].strip()
-            
-        data = json.loads(content)
-        return ResearchSummary(**data)
+        
+        try:
+            data = json.loads(content)
+            return ResearchSummary(**data)
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error parsing research data: {str(e)}", exc_info=True)
+            logger.error(f"Raw content: {content}")
+            raise
