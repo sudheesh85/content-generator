@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+pydantic
+python-dotenv
+python-multipart
+agent-framework
+agent-framework-core
+agent-framework-azure-ai
+openai
+tenacity
+aiohttp
+aiofiles
+pytrends
+python-instagram
+facebook-sdk
